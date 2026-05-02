@@ -1,82 +1,54 @@
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import Response, JSONResponse
+from fastapi import File, UploadFile
+from fastapi.responses import JSONResponse
+import fitz
 
-from app.schemas import ExtractPortfolioRequest
 from app.extractor import (
+    extract_money_values,
+    extract_percent_values,
+    extract_dates,
+    extract_standalone_ints,
     extract_portfolio_csv_from_pdf_bytes,
-    extract_portfolio_csv_from_pdf_url,
-)
-
-app = FastAPI(
-    title="Portfolio Extraction API",
-    description="API para reconstruir PDF de carteira e retornar CSV padronizado.",
-    version="0.1.0",
 )
 
 
-@app.get("/health")
-def health():
+@app.get("/debug-version")
+def debug_version():
     return {
         "ok": True,
-        "service": "portfolio-extraction-api",
-        "version": "0.1.0",
+        "version": "DEBUG_XP_EXTRACTOR_2026_05_02",
+        "message": "Se isso aparecer, o deploy novo está ativo."
     }
 
 
-@app.post("/extract-portfolio-csv")
-def extract_portfolio_csv(payload: ExtractPortfolioRequest):
+@app.post("/debug-upload")
+async def debug_upload(file: UploadFile = File(...)):
     try:
-        csv_content = extract_portfolio_csv_from_pdf_url(str(payload.portfolio_pdf_url))
-
-        filename = "portfolio_extracted.csv"
-        if payload.report_id:
-            filename = f"{payload.report_id}_portfolio_extracted.csv"
-
-        return Response(
-            content=csv_content,
-            media_type="text/csv",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"'
-            },
-        )
-
-    except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "ok": False,
-                "error": str(error),
-            },
-        )
-
-
-@app.post("/extract-portfolio-csv/upload")
-async def extract_portfolio_csv_upload(file: UploadFile = File(...)):
-    try:
-        if not file.filename.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail="File must be a PDF.")
-
         pdf_bytes = await file.read()
-        csv_content = extract_portfolio_csv_from_pdf_bytes(pdf_bytes)
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-        filename = file.filename.replace(".pdf", "_portfolio_extracted.csv")
+        page_1 = doc.load_page(0).get_text("text")
+        page_4 = doc.load_page(3).get_text("text")
 
-        return Response(
-            content=csv_content,
-            media_type="text/csv",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"'
-            },
-        )
+        csv_result = extract_portfolio_csv_from_pdf_bytes(pdf_bytes)
 
-    except HTTPException:
-        raise
+        return {
+            "ok": True,
+            "page_count": doc.page_count,
+            "page_1_preview": page_1[:1200],
+            "page_4_preview": page_4[:1200],
+            "money_1": extract_money_values(page_1),
+            "pct_1": extract_percent_values(page_1),
+            "money_4": extract_money_values(page_4),
+            "dates_4": extract_dates(page_4),
+            "ints_4": extract_standalone_ints(page_4),
+            "csv_preview": csv_result[:1500]
+        }
 
     except Exception as error:
-        raise HTTPException(
+        return JSONResponse(
             status_code=500,
-            detail={
+            content={
                 "ok": False,
-                "error": str(error),
-            },
+                "error": str(error)
+            }
         )
