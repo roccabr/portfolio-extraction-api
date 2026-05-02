@@ -1,12 +1,17 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import Response
+from pydantic import BaseModel
 from pypdf import PdfReader, PdfWriter, Transformation
 from pypdf._page import PageObject
 from io import BytesIO
-import math
+import urllib.request
 
 
 app = FastAPI(title="Portfolio Extraction API")
+
+
+class PdfUrlRequest(BaseModel):
+    pdf_url: str
 
 
 @app.get("/")
@@ -18,42 +23,19 @@ def healthcheck():
 
 
 def safe_page_size(page):
-    """
-    Retorna largura e altura da página em pontos PDF.
-    """
     width = float(page.mediabox.width)
     height = float(page.mediabox.height)
     return width, height
 
 
-@app.post("/combine-side-by-side")
-async def combine_side_by_side(file: UploadFile = File(...)):
-    """
-    Recebe um PDF com páginas fora de ordem visual e devolve um novo PDF
-    com as páginas lado a lado.
-
-    Regra:
-    - página 1 com página 4
-    - página 2 com página 5
-    - página 3 com página 6
-
-    Para PDFs maiores, a lógica geral é:
-    primeira metade + segunda metade.
-    Exemplo:
-    1 + 4
-    2 + 5
-    3 + 6
-    """
-
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Envie um arquivo PDF.")
-
-    input_bytes = await file.read()
-
+def combine_pdf_bytes(input_bytes: bytes) -> bytes:
     try:
         reader = PdfReader(BytesIO(input_bytes))
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Não foi possível ler o PDF: {str(e)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Não foi possível ler o PDF: {str(e)}"
+        )
 
     total_pages = len(reader.pages)
 
@@ -77,7 +59,6 @@ async def combine_side_by_side(file: UploadFile = File(...)):
             left_page = reader.pages[i]
             right_page = reader.pages[i + half]
 
-            # Normaliza rotação para evitar páginas viradas ou deslocadas.
             try:
                 left_page.transfer_rotation_to_content()
             except Exception:
@@ -99,7 +80,6 @@ async def combine_side_by_side(file: UploadFile = File(...)):
                 height=new_height
             )
 
-            # Centraliza verticalmente caso as páginas tenham alturas diferentes.
             left_y = (new_height - left_height) / 2
             right_y = (new_height - right_height) / 2
 
@@ -118,17 +98,68 @@ async def combine_side_by_side(file: UploadFile = File(...)):
         output = BytesIO()
         writer.write(output)
         output.seek(0)
-
-        return Response(
-            content=output.read(),
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": 'attachment; filename="combined-side-by-side.pdf"'
-            }
-        )
+        return output.read()
 
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Erro ao combinar páginas do PDF: {str(e)}"
         )
+
+
+@app.post("/combine-side-by-side")
+async def combine_side_by_side(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Envie um arquivo PDF.")
+
+    input_bytes = await file.read()
+    output_bytes = combine_pdf_bytes(input_bytes)
+
+    return Response(
+        content=output_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": 'attachment; filename="combined-side-by-side.pdf"'
+        }
+    )
+
+
+@app.post("/combine-side-by-side-url")
+async def combine_side_by_side_url(payload: PdfUrlRequest):
+    try:
+        request = urllib.request.Request(
+            payload.pdf_url,
+            headers={
+                "User-Agent": "Mozilla/5.0"
+            }
+        )
+
+        with urllib.request.urlopen(request, timeout=30) as response:
+            content_type = response.headers.get("Content-Type", "")
+
+            if "pdf" not in content_type.lower():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"A URL não retornou um PDF. Content-Type recebido: {content_type}"
+                )
+
+            input_bytes = response.read()
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Não foi possível baixar o PDF pela URL informada: {str(e)}"
+        )
+
+    output_bytes = combine_pdf_bytes(input_bytes)
+
+    return Response(
+        content=output_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": 'attachment; filename="combined-side-by-side.pdf"'
+        }
+    )
