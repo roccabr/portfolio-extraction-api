@@ -156,13 +156,8 @@ def clean_money(value):
 
 
 def clean_ativo_name(categoria, ativo):
-    """
-    Remove cabeçalhos e pedaços de linhas anteriores que o PDF gruda
-    no nome do ativo durante a extração.
-    """
     text = clean_text(ativo)
 
-    # Remove cabeçalhos comuns
     headers_to_remove = [
         "Data do investimento Valor aplicado Valor líquido Data da cota",
         "Data do investimento Preço médio Último preço (R$) Qtd. total",
@@ -178,25 +173,15 @@ def clean_ativo_name(categoria, ativo):
 
     text = clean_text(text)
 
-    # Remove datas soltas no começo
     text = re.sub(r"^\d{2}/\d{2}/\d{4}\s+", "", text)
-
-    # Remove anos soltos no começo, ex: "2024 Brave I..."
     text = re.sub(r"^20\d{2}\s+", "", text)
-
-    # Remove restos numéricos grudados antes de ticker
-    # Ex: "94 1642 MRFG3" -> "MRFG3"
-    # Ex: "26 1504 ARZZ3" -> "ARZZ3"
-    # Ex: "58 193 HAPV3" -> "HAPV3"
     text = re.sub(r"^[\d\s\.,]+(?=[A-Z]{4}\d{1,2}\b)", "", text)
 
-    # Para ações, retorna somente o ticker
     if categoria == "Ações":
         ticker_match = re.search(r"\b[A-Z]{4}\d{1,2}\b", text)
         if ticker_match:
             return ticker_match.group(0)
 
-    # Para renda fixa, remove qualquer coisa antes do produto
     if categoria == "Renda Fixa":
         fixed_match = re.search(
             r"\b(CDB|LCI|LCA|CRI|CRA|DEB[ÊE]NTURE|TESOURO)\b.+",
@@ -206,8 +191,15 @@ def clean_ativo_name(categoria, ativo):
         if fixed_match:
             return clean_text(fixed_match.group(0))
 
-    return clean_text(text)
+    if categoria == "Fundos de Investimentos":
+        text = re.sub(r"^Alocação\s+Rentabilidade\s+", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"^\d{1,3}\s+\d{2}/\d{2}/\d{4}\s+", "", text)
+        text = re.sub(r"^\d{2}/\d{2}/\d{4}\s+", "", text)
+        text = re.sub(r"^\d{1,3}\s+", "", text)
 
+        return clean_text(text)
+
+    return clean_text(text)
 
 def get_text_blocks_from_pdf(input_bytes: bytes):
     full_text = ""
