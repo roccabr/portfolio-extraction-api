@@ -1,3 +1,17 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import Response
+from pypdf import PdfReader, PdfWriter, Transformation
+from pypdf._page import PageObject
+from io import BytesIO
+import pdfplumber
+import csv
+import re
+from io import StringIO
+
+
+app = FastAPI(title="Portfolio Extraction API")
+
+
 import pdfplumber
 import csv
 import re
