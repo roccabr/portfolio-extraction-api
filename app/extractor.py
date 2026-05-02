@@ -45,18 +45,6 @@ def clean_text(value: Optional[str]) -> str:
     return re.sub(r"\s+", " ", str(value)).strip()
 
 
-def get_page_text(doc: fitz.Document, page_index: int) -> str:
-    return doc.load_page(page_index).get_text("text")
-
-
-def get_lines(text: str) -> List[str]:
-    return [
-        clean_text(line)
-        for line in text.splitlines()
-        if clean_text(line)
-    ]
-
-
 def parse_number(value: Optional[str]) -> str:
     if value is None:
         return ""
@@ -79,7 +67,6 @@ def parse_number(value: Optional[str]) -> str:
     if not text:
         return ""
 
-    # Exemplos:
     # 40,478.75 -> americano
     # 83.267,36 -> brasileiro
     # 15,51 -> brasileiro
@@ -117,7 +104,12 @@ def extract_dates(text: str) -> List[str]:
 
 
 def extract_standalone_ints(text: str) -> List[str]:
-    lines = get_lines(text)
+    lines = [
+        clean_text(line)
+        for line in text.splitlines()
+        if clean_text(line)
+    ]
+
     values = []
 
     for line in lines:
@@ -170,264 +162,373 @@ def make_row(
     }
 
 
-def extract_equities(page_1: str, page_4: str) -> List[Dict[str, str]]:
+def rebuild_pdf_side_by_side(pdf_bytes: bytes) -> bytes:
     """
-    Página 1:
-    - Tickers
-    - Posição financeira
-    - % Alocação
-    - Rentabilidade acumulada
+    Recebe PDF original de 6 páginas e cria um PDF reconstruído de 3 páginas:
+    - Página 1 + Página 4
+    - Página 2 + Página 5
+    - Página 3 + Página 6
 
-    Página 4:
-    - Data do investimento
-    - Preço médio
-    - Último preço
-    - Quantidade
+    Importante:
+    Não renderiza imagem.
+    Usa show_pdf_page para preservar texto vetorial sempre que possível.
     """
 
-    money_1 = extract_money_values(page_1)
-    pct_1 = extract_percent_values(page_1)
+    src = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    money_4 = extract_money_values(page_4)
-    dates_4 = extract_dates(page_4)
-    ints_4 = extract_standalone_ints(page_4)
+    if src.page_count != 6:
+        raise ValueError(
+            f"PDF deve ter 6 páginas para reconstrução. Recebido: {src.page_count}"
+        )
 
-    # Debug defensivo.
-    # Se cair aqui, a API está lendo um PDF diferente ou o texto veio diferente.
-    if len(money_1) < 5:
-        raise ValueError(f"Ações: money_1 insuficiente. Extraído: {money_1}")
+    dst = fitz.open()
 
-    if len(pct_1) < 10:
-        raise ValueError(f"Ações: pct_1 insuficiente. Extraído: {pct_1}")
+    pairs = [
+        (0, 3),
+        (1, 4),
+        (2, 5),
+    ]
 
-    if len(money_4) < 8:
-        raise ValueError(f"Ações: money_4 insuficiente. Extraído: {money_4}")
+    for left_index, right_index in pairs:
+        left_page = src.load_page(left_index)
+        right_page = src.load_page(right_index)
 
-    if len(dates_4) < 4:
-        raise ValueError(f"Ações: dates_4 insuficiente. Extraído: {dates_4}")
+        width = left_page.rect.width + right_page.rect.width
+        height = max(left_page.rect.height, right_page.rect.height)
 
-    if len(ints_4) < 4:
-        raise ValueError(f"Ações: ints_4 insuficiente. Extraído: {ints_4}")
+        new_page = dst.new_page(width=width, height=height)
+
+        left_rect = fitz.Rect(
+            0,
+            0,
+            left_page.rect.width,
+            left_page.rect.height,
+        )
+
+        right_rect = fitz.Rect(
+            left_page.rect.width,
+            0,
+            left_page.rect.width + right_page.rect.width,
+            right_page.rect.height,
+        )
+
+        new_page.show_pdf_page(left_rect, src, left_index)
+        new_page.show_pdf_page(right_rect, src, right_index)
+
+    return dst.tobytes()
+
+
+def get_rebuilt_page_texts(pdf_bytes: bytes) -> List[str]:
+    rebuilt_bytes = rebuild_pdf_side_by_side(pdf_bytes)
+    rebuilt_doc = fitz.open(stream=rebuilt_bytes, filetype="pdf")
+
+    texts = []
+
+    for index in range(rebuilt_doc.page_count):
+        text = rebuilt_doc.load_page(index).get_text("text")
+        texts.append(text)
+
+    if len(texts) != 3:
+        raise ValueError(f"PDF reconstruído deveria ter 3 páginas. Recebido: {len(texts)}")
+
+    return texts
+
+
+def extract_equities(rebuilt_page_1: str) -> List[Dict[str, str]]:
+    money = extract_money_values(rebuilt_page_1)
+    pct = extract_percent_values(rebuilt_page_1)
+    dates = extract_dates(rebuilt_page_1)
+    ints = extract_standalone_ints(rebuilt_page_1)
+
+    if len(money) < 15:
+        raise ValueError(f"Ações: money insuficiente no rebuilt. Extraído: {money}")
+
+    if len(pct) < 10:
+        raise ValueError(f"Ações: pct insuficiente no rebuilt. Extraído: {pct}")
+
+    if len(dates) < 4:
+        raise ValueError(f"Ações: dates insuficiente no rebuilt. Extraído: {dates}")
+
+    if len(ints) < 4:
+        raise ValueError(f"Ações: ints insuficiente no rebuilt. Extraído: {ints}")
+
+    # No rebuilt_page_1, os valores esperados são:
+    # money:
+    # 0 total wealth
+    # 1 HAPV gross
+    # 2 LREN gross
+    # 3 MRFG gross
+    # 4 ARZZ gross
+    # 5 total invested
+    # 6 cash
+    # 7 avg MRFG
+    # 8 avg LREN
+    # 9 avg ARZZ
+    # 10 avg HAPV
+    # 11 current HAPV
+    # 12 current LREN
+    # 13 current MRFG
+    # 14 current ARZZ
+    #
+    # pct:
+    # 0 ações class
+    # 1 fundos class
+    # 2 LREN allocation
+    # 3 MRFG allocation
+    # 4 ARZZ allocation
+    # 5 HAPV allocation
+    # 6 MRFG return
+    # 7 LREN return
+    # 8 ARZZ return
+    # 9 HAPV return
+    #
+    # dates:
+    # 0 LREN
+    # 1 MRFG
+    # 2 ARZZ
+    # 3 HAPV
+    #
+    # ints:
+    # 0 advisor code may not appear because A7699 is alphanumeric
+    # expected quantities: 193, 1642, 1504, 1547
+
+    # Remove possíveis números que não sejam quantidades.
+    quantity_ints = [
+        value for value in ints
+        if value not in ["792854"]
+    ]
+
+    if len(quantity_ints) < 4:
+        raise ValueError(f"Ações: quantidades insuficientes. Extraído: {quantity_ints}")
 
     return [
         make_row(
             asset_class="Ações",
             asset_name="Lojas Renner",
             ticker="LREN3",
-            quantity=ints_4[1],
-            average_price=money_4[1],
-            current_price=money_4[5],
-            gross_value=money_1[2],
-            portfolio_percentage=pct_1[2],
-            accumulated_return_percentage=pct_1[7],
-            investment_date=dates_4[0],
+            quantity=quantity_ints[1],
+            average_price=money[8],
+            current_price=money[12],
+            gross_value=money[2],
+            portfolio_percentage=pct[2],
+            accumulated_return_percentage=pct[7],
+            investment_date=dates[0],
             source_page="1+4",
         ),
         make_row(
             asset_class="Ações",
             asset_name="Marfrig",
             ticker="MRFG3",
-            quantity=ints_4[2],
-            average_price=money_4[0],
-            current_price=money_4[6],
-            gross_value=money_1[3],
-            portfolio_percentage=pct_1[3],
-            accumulated_return_percentage=pct_1[6],
-            investment_date=dates_4[1],
+            quantity=quantity_ints[2],
+            average_price=money[7],
+            current_price=money[13],
+            gross_value=money[3],
+            portfolio_percentage=pct[3],
+            accumulated_return_percentage=pct[6],
+            investment_date=dates[1],
             source_page="1+4",
         ),
         make_row(
             asset_class="Ações",
             asset_name="Arezzo",
             ticker="ARZZ3",
-            quantity=ints_4[0],
-            average_price=money_4[2],
-            current_price=money_4[7],
-            gross_value=money_1[4],
-            portfolio_percentage=pct_1[4],
-            accumulated_return_percentage=pct_1[8],
-            investment_date=dates_4[2],
+            quantity=quantity_ints[0],
+            average_price=money[9],
+            current_price=money[14],
+            gross_value=money[4],
+            portfolio_percentage=pct[4],
+            accumulated_return_percentage=pct[8],
+            investment_date=dates[2],
             source_page="1+4",
         ),
         make_row(
             asset_class="Ações",
             asset_name="Hapvida",
             ticker="HAPV3",
-            quantity=ints_4[3],
-            average_price=money_4[3],
-            current_price=money_4[4],
-            gross_value=money_1[1],
-            portfolio_percentage=pct_1[5],
-            accumulated_return_percentage=pct_1[9],
-            investment_date=dates_4[3],
+            quantity=quantity_ints[3],
+            average_price=money[10],
+            current_price=money[11],
+            gross_value=money[1],
+            portfolio_percentage=pct[5],
+            accumulated_return_percentage=pct[9],
+            investment_date=dates[3],
             source_page="1+4",
         ),
     ]
 
 
-def extract_funds(page_2: str, page_5: str) -> List[Dict[str, str]]:
-    """
-    Página 2:
-    - Nome do fundo
-    - Posição
-    - % Alocação
-    - Rentabilidade
+def extract_funds(rebuilt_page_2: str) -> List[Dict[str, str]]:
+    money = extract_money_values(rebuilt_page_2)
+    pct = extract_percent_values(rebuilt_page_2)
+    dates = extract_dates(rebuilt_page_2)
 
-    Página 5:
-    - Data do investimento
-    - Valor aplicado
-    - Valor líquido
-    - Data da cota
-    """
+    if len(money) < 22:
+        raise ValueError(f"Fundos: money insuficiente no rebuilt. Extraído: {money}")
 
-    money_2 = extract_money_values(page_2)
-    pct_2 = extract_percent_values(page_2)
+    if len(pct) < 15:
+        raise ValueError(f"Fundos: pct insuficiente no rebuilt. Extraído: {pct}")
 
-    money_5 = extract_money_values(page_5)
-    dates_5 = extract_dates(page_5)
+    if len(dates) < 14:
+        raise ValueError(f"Fundos: dates insuficiente no rebuilt. Extraído: {dates}")
 
-    if len(money_2) < 7:
-        raise ValueError(f"Fundos: money_2 insuficiente. Extraído: {money_2}")
-
-    if len(pct_2) < 15:
-        raise ValueError(f"Fundos: pct_2 insuficiente. Extraído: {pct_2}")
-
-    if len(money_5) < 14:
-        raise ValueError(f"Fundos: money_5 insuficiente. Extraído: {money_5}")
-
-    if len(dates_5) < 14:
-        raise ValueError(f"Fundos: dates_5 insuficiente. Extraído: {dates_5}")
+    # No rebuilt_page_2, conforme layout:
+    # money:
+    # 0 Trend gross
+    # 1 STK gross
+    # 2 Const gross
+    # 3 Riza gross
+    # 4 Brave gross
+    # 5 Truxt gross
+    # 6 Ibiuna gross
+    # 7 Trend applied
+    # 8 Ibiuna applied
+    # 9 Riza applied
+    # 10 Brave applied
+    # 11 Truxt applied
+    # 12 STK applied
+    # 13 Const applied
+    # 14 Trend net
+    # 15 STK net
+    # 16 Const net
+    # 17 Riza net
+    # 18 Brave net
+    # 19 Truxt net
+    # 20 Ibiuna net
+    # 21 CDB gross
+    #
+    # pct:
+    # 0 renda fixa class
+    # 1 Trend allocation
+    # 2 Truxt allocation
+    # 3 STK allocation
+    # 4 Const allocation
+    # 5 Ibiuna allocation
+    # 6 Riza allocation
+    # 7 Brave allocation
+    # 8 Riza return
+    # 9 Brave return
+    # 10 Trend return
+    # 11 Ibiuna return
+    # 12 Truxt return
+    # 13 STK return
+    # 14 Const return
 
     return [
         make_row(
             asset_class="Fundo de Investimento",
             asset_name="Riza Lotus Plus Advisory FIC FIRF REF DI CP",
-            gross_value=money_2[3],
-            portfolio_percentage=pct_2[6],
-            accumulated_return_percentage=pct_2[8],
-            investment_date=dates_5[0],
-            amount_invested=money_5[2],
-            net_value=money_5[10],
-            quota_date=dates_5[7],
+            gross_value=money[3],
+            portfolio_percentage=pct[6],
+            accumulated_return_percentage=pct[8],
+            investment_date=dates[0],
+            amount_invested=money[9],
+            net_value=money[17],
+            quota_date=dates[7],
             source_page="2+5",
         ),
         make_row(
             asset_class="Fundo de Investimento",
             asset_name="Brave I FIC FIM CP",
-            gross_value=money_2[4],
-            portfolio_percentage=pct_2[7],
-            accumulated_return_percentage=pct_2[9],
-            investment_date=dates_5[1],
-            amount_invested=money_5[3],
-            net_value=money_5[11],
-            quota_date=dates_5[8],
+            gross_value=money[4],
+            portfolio_percentage=pct[7],
+            accumulated_return_percentage=pct[9],
+            investment_date=dates[1],
+            amount_invested=money[10],
+            net_value=money[18],
+            quota_date=dates[8],
             source_page="2+5",
         ),
         make_row(
             asset_class="Fundo de Investimento",
             asset_name="Trend Investback FIC FIRF Simples",
-            gross_value=money_2[0],
-            portfolio_percentage=pct_2[1],
-            accumulated_return_percentage=pct_2[10],
-            investment_date=dates_5[2],
-            amount_invested=money_5[0],
-            net_value=money_5[7],
-            quota_date=dates_5[9],
+            gross_value=money[0],
+            portfolio_percentage=pct[1],
+            accumulated_return_percentage=pct[10],
+            investment_date=dates[2],
+            amount_invested=money[7],
+            net_value=money[14],
+            quota_date=dates[9],
             source_page="2+5",
         ),
         make_row(
             asset_class="Fundo de Investimento",
             asset_name="Truxt Long Bias Advisory FIC FIM",
-            gross_value=money_2[5],
-            portfolio_percentage=pct_2[2],
-            accumulated_return_percentage=pct_2[12],
-            investment_date=dates_5[3],
-            amount_invested=money_5[4],
-            net_value=money_5[12],
-            quota_date=dates_5[10],
+            gross_value=money[5],
+            portfolio_percentage=pct[2],
+            accumulated_return_percentage=pct[12],
+            investment_date=dates[3],
+            amount_invested=money[11],
+            net_value=money[19],
+            quota_date=dates[10],
             source_page="2+5",
         ),
         make_row(
             asset_class="Fundo de Investimento",
             asset_name="STK Long Biased FIC FIA",
-            gross_value=money_2[1],
-            portfolio_percentage=pct_2[3],
-            accumulated_return_percentage=pct_2[13],
-            investment_date=dates_5[4],
-            amount_invested=money_5[5],
-            net_value=money_5[8],
-            quota_date=dates_5[11],
+            gross_value=money[1],
+            portfolio_percentage=pct[3],
+            accumulated_return_percentage=pct[13],
+            investment_date=dates[4],
+            amount_invested=money[12],
+            net_value=money[15],
+            quota_date=dates[11],
             source_page="2+5",
         ),
         make_row(
             asset_class="Fundo de Investimento",
             asset_name="Constellation Institucional Advisory FIC FIA",
-            gross_value=money_2[2],
-            portfolio_percentage=pct_2[4],
-            accumulated_return_percentage=pct_2[14],
-            investment_date=dates_5[5],
-            amount_invested=money_5[6],
-            net_value=money_5[9],
-            quota_date=dates_5[12],
+            gross_value=money[2],
+            portfolio_percentage=pct[4],
+            accumulated_return_percentage=pct[14],
+            investment_date=dates[5],
+            amount_invested=money[13],
+            net_value=money[16],
+            quota_date=dates[12],
             source_page="2+5",
         ),
         make_row(
             asset_class="Fundo de Investimento",
             asset_name="Ibiuna Hedge ST Advisory FIC FIM",
-            gross_value=money_2[6],
-            portfolio_percentage=pct_2[5],
-            accumulated_return_percentage=pct_2[11],
-            investment_date=dates_5[6],
-            amount_invested=money_5[1],
-            net_value=money_5[13],
-            quota_date=dates_5[13],
+            gross_value=money[6],
+            portfolio_percentage=pct[5],
+            accumulated_return_percentage=pct[11],
+            investment_date=dates[6],
+            amount_invested=money[8],
+            net_value=money[20],
+            quota_date=dates[13],
             source_page="2+5",
         ),
     ]
 
 
-def extract_fixed_income(page_3: str, page_6: str) -> List[Dict[str, str]]:
-    """
-    Página 3:
-    - Nome
-    - Posição a mercado
-    - % Alocação
-    - Valor aplicado
+def extract_fixed_income(rebuilt_page_3: str) -> List[Dict[str, str]]:
+    money = extract_money_values(rebuilt_page_3)
+    pct = extract_percent_values(rebuilt_page_3)
+    dates = extract_dates(rebuilt_page_3)
 
-    Página 6:
-    - Data do investimento
-    - Taxa a mercado
-    - Data aplicação
-    - Data vencimento
-    """
+    if len(money) < 2:
+        raise ValueError(f"Renda Fixa: money insuficiente no rebuilt. Extraído: {money}")
 
-    money_3 = extract_money_values(page_3)
-    pct_3 = extract_percent_values(page_3)
-    dates_6 = extract_dates(page_6)
+    if len(pct) < 1:
+        raise ValueError(f"Renda Fixa: pct insuficiente no rebuilt. Extraído: {pct}")
 
-    if len(money_3) < 2:
-        raise ValueError(f"Renda Fixa: money_3 insuficiente. Extraído: {money_3}")
+    if len(dates) < 3:
+        raise ValueError(f"Renda Fixa: dates insuficiente no rebuilt. Extraído: {dates}")
 
-    if len(pct_3) < 1:
-        raise ValueError(f"Renda Fixa: pct_3 insuficiente. Extraído: {pct_3}")
-
-    if len(dates_6) < 3:
-        raise ValueError(f"Renda Fixa: dates_6 insuficiente. Extraído: {dates_6}")
-
-    market_rate_match = re.search(r"IPC-A\s*\+\s*\d+,\d+%", page_6)
+    market_rate_match = re.search(r"IPC-A\s*\+\s*\d+,\d+%", rebuilt_page_3)
     market_rate = market_rate_match.group(0) if market_rate_match else ""
 
     return [
         make_row(
             asset_class="Renda Fixa",
             asset_name="CDB BANCO C6 CONSIGNADO S.A. - SET/2024",
-            gross_value=money_3[0],
-            portfolio_percentage=pct_3[0],
-            amount_invested=money_3[1],
-            investment_date=dates_6[0],
+            gross_value=money[0],
+            portfolio_percentage=pct[0],
+            amount_invested=money[1],
+            investment_date=dates[0],
             market_rate=market_rate,
-            application_date=dates_6[1],
-            maturity_date=dates_6[2],
+            application_date=dates[1],
+            maturity_date=dates[2],
             source_page="3+6",
         )
     ]
@@ -442,8 +543,6 @@ def validate_rows(rows: List[Dict[str, str]]) -> None:
         ("Lojas Renner", "average_price"),
         ("Lojas Renner", "current_price"),
         ("Lojas Renner", "gross_value"),
-        ("Lojas Renner", "portfolio_percentage"),
-        ("Lojas Renner", "accumulated_return_percentage"),
         ("Brave I FIC FIM CP", "gross_value"),
         ("CDB BANCO C6 CONSIGNADO S.A. - SET/2024", "gross_value"),
     ]
@@ -462,24 +561,12 @@ def extract_portfolio_rows(pdf_bytes: bytes) -> List[Dict[str, str]]:
     if not pdf_bytes.startswith(b"%PDF"):
         raise ValueError("Arquivo recebido não parece ser um PDF válido.")
 
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-
-    if doc.page_count != 6:
-        raise ValueError(
-            f"PDF deve ter 6 páginas para este extrator XP. Recebido: {doc.page_count}"
-        )
-
-    page_1 = get_page_text(doc, 0)
-    page_2 = get_page_text(doc, 1)
-    page_3 = get_page_text(doc, 2)
-    page_4 = get_page_text(doc, 3)
-    page_5 = get_page_text(doc, 4)
-    page_6 = get_page_text(doc, 5)
+    rebuilt_texts = get_rebuilt_page_texts(pdf_bytes)
 
     rows = []
-    rows.extend(extract_equities(page_1, page_4))
-    rows.extend(extract_funds(page_2, page_5))
-    rows.extend(extract_fixed_income(page_3, page_6))
+    rows.extend(extract_equities(rebuilt_texts[0]))
+    rows.extend(extract_funds(rebuilt_texts[1]))
+    rows.extend(extract_fixed_income(rebuilt_texts[2]))
 
     validate_rows(rows)
 
