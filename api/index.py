@@ -123,11 +123,6 @@ async def combine_side_by_side(file: UploadFile = File(...)):
 # 2) EXTRAIR PDF PARA CSV ORGANIZADO
 # ===============================
 
-import csv
-import re
-from io import StringIO
-
-
 CSV_FIELDS = [
     "categoria",
     "ativo",
@@ -153,12 +148,68 @@ def clean_text(value):
     return re.sub(r"\s+", " ", str(value).replace("\n", " ")).strip()
 
 
+def clean_money(value):
+    value = clean_text(value)
+    if not value:
+        return ""
+    return value.replace("R$", "R$ ").replace("R$  ", "R$ ").strip()
+
+
+def clean_ativo_name(categoria, ativo):
+    """
+    Remove cabeçalhos e pedaços de linhas anteriores que o PDF gruda
+    no nome do ativo durante a extração.
+    """
+    text = clean_text(ativo)
+
+    # Remove cabeçalhos comuns
+    headers_to_remove = [
+        "Data do investimento Valor aplicado Valor líquido Data da cota",
+        "Data do investimento Preço médio Último preço (R$) Qtd. total",
+        "Data do investimento Taxa a mercado Data aplicação Data vencimento",
+        "Posição a mercado % Alocação Valor aplicado",
+        "Posição % Alocação Rentabilidade (%)",
+        "Posição % Alocação Rentabilidade",
+        "Qtd. total",
+    ]
+
+    for header in headers_to_remove:
+        text = re.sub(re.escape(header), "", text, flags=re.IGNORECASE)
+
+    text = clean_text(text)
+
+    # Remove datas soltas no começo
+    text = re.sub(r"^\d{2}/\d{2}/\d{4}\s+", "", text)
+
+    # Remove anos soltos no começo, ex: "2024 Brave I..."
+    text = re.sub(r"^20\d{2}\s+", "", text)
+
+    # Remove restos numéricos grudados antes de ticker
+    # Ex: "94 1642 MRFG3" -> "MRFG3"
+    # Ex: "26 1504 ARZZ3" -> "ARZZ3"
+    # Ex: "58 193 HAPV3" -> "HAPV3"
+    text = re.sub(r"^[\d\s\.,]+(?=[A-Z]{4}\d{1,2}\b)", "", text)
+
+    # Para ações, retorna somente o ticker
+    if categoria == "Ações":
+        ticker_match = re.search(r"\b[A-Z]{4}\d{1,2}\b", text)
+        if ticker_match:
+            return ticker_match.group(0)
+
+    # Para renda fixa, remove qualquer coisa antes do produto
+    if categoria == "Renda Fixa":
+        fixed_match = re.search(
+            r"\b(CDB|LCI|LCA|CRI|CRA|DEB[ÊE]NTURE|TESOURO)\b.+",
+            text,
+            flags=re.IGNORECASE
+        )
+        if fixed_match:
+            return clean_text(fixed_match.group(0))
+
+    return clean_text(text)
+
+
 def get_text_blocks_from_pdf(input_bytes: bytes):
-    """
-    Extrai o texto bruto do PDF combinado.
-    Como o PDF já está lado a lado, o texto costuma vir em blocos grandes.
-    Depois fazemos parsing por padrões de produtos financeiros.
-    """
     full_text = ""
 
     with pdfplumber.open(BytesIO(input_bytes)) as pdf:
@@ -171,36 +222,28 @@ def get_text_blocks_from_pdf(input_bytes: bytes):
 
 def parse_money_percent_rows(text, categoria):
     """
-    Parser genérico para linhas com:
+    Extrai linhas com:
     ativo + posição + % alocação + rentabilidade
-
-    Exemplo:
-    LREN3 R$27,812.04 8.91% -41,7%
     """
     rows = []
 
     pattern = re.compile(
-        r"(?P<ativo>[A-Za-z0-9À-ÿ\.\-\&\s]+?)\s+"
+        r"(?P<ativo>[A-Za-z0-9À-ÿ\.\-\&\(\)\/\s]+?)\s+"
         r"(?P<posicao>R\$\s?[\d\.,]+)\s+"
         r"(?P<alocacao>[\d\.,]+%)\s+"
-        r"(?P<rentabilidade>[-]?\d+,\d+%|[-]?\d+\.\d+%)"
+        r"(?P<rentabilidade>[-]?\d+[,.]\d+%)"
     )
 
     for match in pattern.finditer(text):
-        ativo = clean_text(match.group("ativo"))
+        ativo = clean_ativo_name(categoria, match.group("ativo"))
 
-        # Remove possíveis títulos grudados antes do ativo
-        ativo = re.sub(r"^.*?(Rentabilidade\s*\(?%?\)?\s*)", "", ativo).strip()
-        ativo = re.sub(r"^.*?(Rentabilidade\s*)", "", ativo).strip()
-
-        # Evita capturar frases muito grandes como ativo
-        if len(ativo) > 120:
-            ativo = " ".join(ativo.split()[-12:])
+        if not ativo:
+            continue
 
         rows.append({
             "categoria": categoria,
             "ativo": ativo,
-            "posicao": clean_text(match.group("posicao")),
+            "posicao": clean_money(match.group("posicao")),
             "alocacao_pct": clean_text(match.group("alocacao")),
             "rentabilidade_pct": clean_text(match.group("rentabilidade")),
             "data_investimento": "",
@@ -220,11 +263,8 @@ def parse_money_percent_rows(text, categoria):
 
 def extract_dates_and_stock_details(text):
     """
-    Extrai detalhes de ações:
-    data_investimento, preço_médio, último_preço e quantidade.
-
-    Exemplo:
-    22/04/2021 R$ 29,05 R$ 16,94 1642
+    Detalhes de ações:
+    data_investimento, preço médio, último preço e quantidade.
     """
     pattern = re.compile(
         r"(?P<data>\d{2}/\d{2}/\d{4})\s+"
@@ -236,8 +276,8 @@ def extract_dates_and_stock_details(text):
     return [
         {
             "data_investimento": clean_text(m.group("data")),
-            "preco_medio": clean_text(m.group("preco_medio")),
-            "ultimo_preco": clean_text(m.group("ultimo_preco")),
+            "preco_medio": clean_money(m.group("preco_medio")),
+            "ultimo_preco": clean_money(m.group("ultimo_preco")),
             "qtd_total": clean_text(m.group("qtd")),
         }
         for m in pattern.finditer(text)
@@ -246,11 +286,8 @@ def extract_dates_and_stock_details(text):
 
 def extract_fund_details(text):
     """
-    Extrai detalhes de fundos:
+    Detalhes de fundos:
     data_investimento, valor_aplicado, valor_liquido e data_cota.
-
-    Exemplo:
-    22/04/2021 R$ 83.267,36 R$ 95.254,02 04/04/2024
     """
     pattern = re.compile(
         r"(?P<data>\d{2}/\d{2}/\d{4})\s+"
@@ -262,8 +299,8 @@ def extract_fund_details(text):
     return [
         {
             "data_investimento": clean_text(m.group("data")),
-            "valor_aplicado": clean_text(m.group("valor_aplicado")),
-            "valor_liquido": clean_text(m.group("valor_liquido")),
+            "valor_aplicado": clean_money(m.group("valor_aplicado")),
+            "valor_liquido": clean_money(m.group("valor_liquido")),
             "data_cota": clean_text(m.group("data_cota")),
         }
         for m in pattern.finditer(text)
@@ -271,25 +308,19 @@ def extract_fund_details(text):
 
 
 def extract_fixed_income_rows(text):
-    """
-    Extrai renda fixa.
-
-    Exemplo:
-    CDB BANCO C6 CONSIGNADO S.A. - SET/2024 R$40,478.75 12.97% R$ 30.000,00
-    09/11/2023 IPC-A +5,45% 06/09/2021 05/09/2024
-    """
     rows = []
 
     asset_pattern = re.compile(
-        r"(?P<ativo>CDB\s+.+?)\s+"
+        r"(?P<ativo>(?:CDB|LCI|LCA|CRI|CRA|DEB[ÊE]NTURE|TESOURO)\s+.+?)\s+"
         r"(?P<posicao>R\$\s?[\d\.,]+)\s+"
         r"(?P<alocacao>[\d\.,]+%)\s+"
-        r"(?P<valor_aplicado>R\$\s?[\d\.,]+)"
+        r"(?P<valor_aplicado>R\$\s?[\d\.,]+)",
+        flags=re.IGNORECASE
     )
 
     detail_pattern = re.compile(
         r"(?P<data_investimento>\d{2}/\d{2}/\d{4})\s+"
-        r"(?P<taxa>[^0-9]{0,20}[A-Z\-]+\s?[+\-]?\d+,\d+%)\s+"
+        r"(?P<taxa>[A-ZÀ-ÿ\-\s]+[+\-]\s?\d+,\d+%)\s+"
         r"(?P<data_aplicacao>\d{2}/\d{2}/\d{4})\s+"
         r"(?P<data_vencimento>\d{2}/\d{2}/\d{4})"
     )
@@ -302,15 +333,15 @@ def extract_fixed_income_rows(text):
 
         rows.append({
             "categoria": "Renda Fixa",
-            "ativo": clean_text(asset.group("ativo")),
-            "posicao": clean_text(asset.group("posicao")),
+            "ativo": clean_ativo_name("Renda Fixa", asset.group("ativo")),
+            "posicao": clean_money(asset.group("posicao")),
             "alocacao_pct": clean_text(asset.group("alocacao")),
             "rentabilidade_pct": "",
             "data_investimento": clean_text(detail.group("data_investimento")) if detail else "",
             "preco_medio": "",
             "ultimo_preco": "",
             "qtd_total": "",
-            "valor_aplicado": clean_text(asset.group("valor_aplicado")),
+            "valor_aplicado": clean_money(asset.group("valor_aplicado")),
             "valor_liquido": "",
             "data_cota": "",
             "taxa_mercado": clean_text(detail.group("taxa")) if detail else "",
@@ -322,10 +353,6 @@ def extract_fixed_income_rows(text):
 
 
 def merge_rows_with_details(rows, details, detail_type):
-    """
-    Junta os detalhes extraídos por ordem.
-    Para esse PDF, a ordem dos ativos na esquerda acompanha a ordem dos detalhes na direita.
-    """
     final_rows = []
 
     for i, row in enumerate(rows):
@@ -340,7 +367,7 @@ def merge_rows_with_details(rows, details, detail_type):
                 new_row["ultimo_preco"] = detail.get("ultimo_preco", "")
                 new_row["qtd_total"] = detail.get("qtd_total", "")
 
-            if detail_type == "funds":
+            elif detail_type == "funds":
                 new_row["data_investimento"] = detail.get("data_investimento", "")
                 new_row["valor_aplicado"] = detail.get("valor_aplicado", "")
                 new_row["valor_liquido"] = detail.get("valor_liquido", "")
@@ -352,9 +379,6 @@ def merge_rows_with_details(rows, details, detail_type):
 
 
 def split_text_sections(text):
-    """
-    Divide o texto em seções principais.
-    """
     acoes_text = ""
     fundos_text = ""
     renda_fixa_text = ""
@@ -376,22 +400,17 @@ def extract_portfolio_rows(input_bytes: bytes):
 
     acoes_text, fundos_text, renda_fixa_text = split_text_sections(text)
 
-    # Ações
     stock_rows = parse_money_percent_rows(acoes_text, "Ações")
     stock_details = extract_dates_and_stock_details(acoes_text)
     stock_rows = merge_rows_with_details(stock_rows, stock_details, "stocks")
 
-    # Fundos
     fund_rows = parse_money_percent_rows(fundos_text, "Fundos de Investimentos")
     fund_details = extract_fund_details(fundos_text)
     fund_rows = merge_rows_with_details(fund_rows, fund_details, "funds")
 
-    # Renda fixa
     fixed_income_rows = extract_fixed_income_rows(renda_fixa_text)
 
-    rows = stock_rows + fund_rows + fixed_income_rows
-
-    return rows
+    return stock_rows + fund_rows + fixed_income_rows
 
 
 def rows_to_csv(rows):
